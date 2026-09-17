@@ -1,9 +1,9 @@
-import 'dart:convert';import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:csv/csv.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -36,9 +36,10 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  BluetoothConnection? _connection;
-  StreamSubscription<Uint8List>? _btSub;
-  List<BluetoothDevice> _devices = [];
+  BluetoothDevice? _device;
+  BluetoothCharacteristic? _notifyChar;
+  StreamSubscription<List<int>>? _bleSub;
+  bool _isScanning = false;
   bool _isConnected = false;
   String _status = "Disconnected";
 
@@ -65,47 +66,84 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _init() async {
-    await [Permission.location, Permission.bluetooth, Permission.bluetoothConnect].request();
+    await [Permission.location, Permission.bluetoothScan, Permission.bluetoothConnect].request();
     _prefs = await SharedPreferences.getInstance();
     setState(() {
       _calFactor = _prefs.getDouble('cal') ?? 1.0;
       _calDate = _prefs.getString('calDate') ?? 'Never';
     });
-    _loadDevices();
+    _startScan();
   }
 
-  Future<void> _loadDevices() async {
-    try {
-      final devices = await FlutterBluetoothSerial.instance.getBondedDevices();
-      setState(() => _devices = devices);
-    } catch (e) {
-      print('Error loading devices: $e');
-    }
+  Future<void> _startScan() async {
+    setState(() {
+      _isScanning = true;
+      _status = "Scanning...";
+    });
+
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
+
+    FlutterBluePlus.scanResults.listen((results) {
+      for (final r in results) {
+        final name = r.device.platformName;
+        if (name.contains("LWD-BMI160-Probe") || name.contains("LWD")) {
+          FlutterBluePlus.stopScan();
+          if (mounted) setState(() => _isScanning = false);
+          _connect(r.device);
+          return;
+        }
+      }
+    });
+
+    Future.delayed(const Duration(seconds: 9), () {
+      if (mounted) setState(() => _isScanning = false);
+    });
   }
 
   Future<void> _connect(BluetoothDevice device) async {
     setState(() => _status = "Connecting...");
     try {
-      _connection = await BluetoothConnection.toAddress(device.address);
+      await device.connect(timeout: const Duration(seconds: 15));
+      final services = await device.discoverServices();
+
+      BluetoothCharacteristic? target;
+      for (final s in services) {
+        for (final c in s.characteristics) {
+          if (c.uuid.toString().toLowerCase() ==
+              "6e400002-b5a3-f393-e0a9-e50e24dcca9e") {
+            target = c;
+            break;
+          }
+        }
+        if (target != null) break;
+      }
+
+      if (target == null) throw Exception("Characteristic not found");
+
+      _device = device;
+      _notifyChar = target;
+      await target.setNotifyValue(true);
+
+      _bleSub = target.onValueReceived.listen((value) {
+        final text = utf8.decode(value, allowMalformed: true);
+        _parse(text);
+      });
+
       setState(() {
         _isConnected = true;
         _status = "Online";
       });
-      _btSub = _connection!.input!.listen((data) {
-        final text = ascii.decode(data, allowInvalid: true);
-        _parse(text);
-      }, onDone: _disconnect);
     } catch (e) {
       setState(() {
         _isConnected = false;
-        _status = "Failed: $e";
+        _status = "Failed";
       });
     }
   }
 
   void _disconnect() {
-    _btSub?.cancel();
-    _connection?.close();
+    _bleSub?.cancel();
+    _device?.disconnect();
     setState(() {
       _isConnected = false;
       _status = "Disconnected";
@@ -199,41 +237,6 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  void _showDeviceList() {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Select HC-05 Device'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: _devices.isEmpty
-              ? const Text('No paired devices. Pair HC-05 in phone Bluetooth settings first.')
-              : ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: _devices.length,
-                  itemBuilder: (c, i) => ListTile(
-                    title: Text(_devices[i].name ?? 'Unknown'),
-                    subtitle: Text(_devices[i].address),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _connect(_devices[i]);
-                    },
-                  ),
-                ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              _loadDevices();
-              Navigator.pop(ctx);
-            },
-            child: const Text('Refresh'),
-          ),
-        ],
-      ),
-    );
-  }
-
   void _showCalDialog() {
     final pass = TextEditingController();
     showDialog(
@@ -304,10 +307,7 @@ class _HomePageState extends State<HomePage> {
         backgroundColor: const Color(0xFF0A192F),
         title: const Text('LWD PRO', style: TextStyle(fontWeight: FontWeight.bold)),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.lock, color: Colors.amber),
-            onPressed: _showCalDialog,
-          ),
+          IconButton(icon: const Icon(Icons.lock, color: Colors.amber), onPressed: _showCalDialog),
           Container(
             margin: const EdgeInsets.symmetric(vertical: 14, horizontal: 4),
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -318,8 +318,10 @@ class _HomePageState extends State<HomePage> {
             child: Text(_status, style: const TextStyle(fontSize: 10)),
           ),
           IconButton(
-            icon: const Icon(Icons.bluetooth),
-            onPressed: _isConnected ? null : _showDeviceList,
+            icon: _isScanning
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.bluetooth_searching),
+            onPressed: _isConnected ? null : _startScan,
           ),
           IconButton(
             icon: const Icon(Icons.power_settings_new),
@@ -334,9 +336,7 @@ class _HomePageState extends State<HomePage> {
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF112240), Color(0xFF1A365D)],
-                ),
+                gradient: const LinearGradient(colors: [Color(0xFF112240), Color(0xFF1A365D)]),
                 borderRadius: BorderRadius.circular(16),
               ),
               child: Column(
@@ -349,9 +349,7 @@ class _HomePageState extends State<HomePage> {
                         children: [
                           const Text('EVD', style: TextStyle(color: Colors.grey, fontSize: 12)),
                           Text('${_evd.toStringAsFixed(1)}',
-                              style: const TextStyle(
-                                fontSize: 44, fontWeight: FontWeight.bold, color: Color(0xFF00E5FF),
-                              )),
+                              style: const TextStyle(fontSize: 44, fontWeight: FontWeight.bold, color: Color(0xFF00E5FF))),
                           const Text('MN/m²', style: TextStyle(color: Colors.grey, fontSize: 12)),
                         ],
                       ),
@@ -360,9 +358,7 @@ class _HomePageState extends State<HomePage> {
                         children: [
                           const Text('DEFLECTION', style: TextStyle(color: Colors.grey, fontSize: 12)),
                           Text('${_deflection.toStringAsFixed(3)}',
-                              style: const TextStyle(
-                                fontSize: 28, fontWeight: FontWeight.bold, color: Colors.orangeAccent,
-                              )),
+                              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.orangeAccent)),
                           const Text('mm', style: TextStyle(color: Colors.grey, fontSize: 12)),
                         ],
                       ),
@@ -377,8 +373,7 @@ class _HomePageState extends State<HomePage> {
                           color: passed ? Colors.green.shade900 : Colors.red.shade900,
                           borderRadius: BorderRadius.circular(20),
                         ),
-                        child: Text(passed ? 'PASS' : 'FAIL',
-                            style: const TextStyle(fontWeight: FontWeight.bold)),
+                        child: Text(passed ? 'PASS' : 'FAIL', style: const TextStyle(fontWeight: FontWeight.bold)),
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -386,9 +381,7 @@ class _HomePageState extends State<HomePage> {
                           value: (_evd / 80).clamp(0.0, 1.0),
                           minHeight: 8,
                           backgroundColor: Colors.grey.shade800,
-                          valueColor: AlwaysStoppedAnimation(
-                            passed ? Colors.green : Colors.red,
-                          ),
+                          valueColor: AlwaysStoppedAnimation(passed ? Colors.green : Colors.red),
                         ),
                       ),
                     ],
@@ -398,9 +391,7 @@ class _HomePageState extends State<HomePage> {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Text(
-                        _latitude != 0
-                            ? '${_latitude.toStringAsFixed(4)}, ${_longitude.toStringAsFixed(4)}'
-                            : 'No GPS',
+                        _latitude != 0 ? '${_latitude.toStringAsFixed(4)}, ${_longitude.toStringAsFixed(4)}' : 'No GPS',
                         style: const TextStyle(color: Colors.grey, fontSize: 11),
                       ),
                       Text('#$_testCount', style: const TextStyle(color: Colors.grey, fontSize: 11)),
@@ -413,31 +404,20 @@ class _HomePageState extends State<HomePage> {
             Expanded(
               child: Container(
                 padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF112240),
-                  borderRadius: BorderRadius.circular(16),
-                ),
+                decoration: BoxDecoration(color: const Color(0xFF112240), borderRadius: BorderRadius.circular(16)),
                 child: LineChart(
                   LineChartData(
                     gridData: const FlGridData(show: true, drawVerticalLine: false),
                     titlesData: const FlTitlesData(show: false),
                     borderData: FlBorderData(show: false),
-                    minX: 0,
-                    maxX: 30,
-                    minY: -0.2,
-                    maxY: 2.0,
+                    minX: 0, maxX: 30, minY: -0.2, maxY: 2.0,
                     lineBarsData: [
                       LineChartBarData(
-                        spots: _waveform.asMap().entries.map(
-                              (e) => FlSpot(e.key.toDouble(), e.value),
-                            ).toList(),
+                        spots: _waveform.asMap().entries.map((e) => FlSpot(e.key.toDouble(), e.value)).toList(),
                         isCurved: true,
                         color: const Color(0xFF00E5FF),
                         barWidth: 2,
-                        belowBarData: BarAreaData(
-                          show: true,
-                          color: const Color(0xFF00E5FF).withOpacity(0.1),
-                        ),
+                        belowBarData: BarAreaData(show: true, color: const Color(0xFF00E5FF).withOpacity(0.1)),
                       ),
                     ],
                   ),
@@ -452,28 +432,20 @@ class _HomePageState extends State<HomePage> {
                     onPressed: _exportCsv,
                     icon: const Icon(Icons.save),
                     label: const Text('EXPORT CSV'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF1A365D),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
+                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A365D), padding: const EdgeInsets.symmetric(vertical: 12)),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton.icon(
-                    onPressed: () {
-                      setState(() {
-                        _waveform.fillRange(0, _waveform.length, 0.0);
-                        _evd = 0;
-                        _deflection = 0;
-                      });
-                    },
+                    onPressed: () => setState(() {
+                      _waveform.fillRange(0, _waveform.length, 0.0);
+                      _evd = 0;
+                      _deflection = 0;
+                    }),
                     icon: const Icon(Icons.clear),
                     label: const Text('CLEAR'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.red.shade900,
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade900, padding: const EdgeInsets.symmetric(vertical: 12)),
                   ),
                 ),
               ],
